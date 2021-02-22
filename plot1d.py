@@ -10,11 +10,15 @@ from matplotlib.ticker import (MultipleLocator, FormatStrFormatter, AutoMinorLoc
 import scipy.stats as stats
 import scipy.optimize as opt
 import scipy.integrate as integrate 
+import scipy.signal as signal
 from scipy import interpolate
 import h5py
+from mpi4py import MPI
 
 # Import athena data reader
-sys.path.append('/Users/tsunhinnavintsung/Workspace/Codes/Athena++')
+athena_path = '/Users/tsunhinnavintsung/Workspace/Codes/Athena++'
+if athena_path not in sys.path:
+  sys.path.append(athena_path) 
 import athena_read3 as ar 
 
 # Matplotlib default param
@@ -50,7 +54,7 @@ def latexify(columns=2, square=False, num_fig=0):
   fig_width_pt = 240.0 if (columns == 1) else 504.0
   inches_per_pt = 1./72.27 # Convert pt to inch
   golden_mean = (np.sqrt(5.) - 1.)/2. 
-  square_size = 1.
+  square_size = 0.8
   fig_width = fig_width_pt*inches_per_pt # Width in inches
   fig_height = fig_width*golden_mean
   if square:
@@ -82,10 +86,11 @@ tiny_number = 1.e-10
 big_number = 1.e20
 
 class Plot1d:
-  def __init__(self, inputfile, file_array, video=False, staircase=False, history=False, profile_in=None):
+  def __init__(self, inputfile, file_array, video=False, staircase=False, history=False, avg=False, profile_in=None, with_v=False):
     # Staircase, history are specific to this problem only
     self.inputfile = inputfile
     self.file_array = file_array
+    self.with_v = with_v
     self.isothermal = True
     self.cr = False
     self.b_field = False
@@ -103,9 +108,13 @@ class Plot1d:
       self.passive = True
 
     if not profile_in == None:
-      self.profile_object = Power(profile_in)
-      self.profile_object.powerprofile(self.x1min, self.x1max, self.nx1)
-    if video or staircase or history:
+      if self.isothermal:
+        self.profile_object = Power_v_iso(profile_in) if with_v else Power_iso(profile_in)
+        self.profile_object.powerprofile(self.x1min, self.x1max, self.nx1)
+      else:
+        self.profile_object = Power_v(profile_in) if with_v else Power(profile_in)
+        self.profile_object.powerprofile(self.x1min, self.x1max, self.nx1)
+    if video or staircase or history or avg:
       pass
     else:
       self.read_data()
@@ -249,7 +258,7 @@ class Plot1d:
 
   # Simplified data reader for making video
   # Input: equi, background to be subtracted
-  def make_video(self, equi, save_path):
+  def make_video(self, equi, save_path, logx=False, logy=False):
     filename = self.filename 
 
     # Choosing files for display
@@ -258,21 +267,24 @@ class Plot1d:
 
     # For no adaptive mesh refinement
     x1v = np.array(ar.athdf('./' + filename + '.out1.' + format(file_array[0], '05d') + '.athdf')['x1v'])
-    dx = x1v[1] - x1v[0]
 
     # Equilibrium profile
     rho_eq = equi['rho']
+    v_eq = equi['v']
     if not self.isothermal:
       pg_eq = equi['pg']
     if self.cr:
       pc_eq = equi['pc']
+      fc_eq = equi['fc']
 
     # Number of parameters of interest
     rho_array = np.zeros(np.size(x1v))
+    v_array = np.zeros(np.size(x1v))
     if not self.isothermal:
       pg_array = np.zeros(np.size(x1v))
     if self.cr:
       ecr_array = np.zeros(np.size(x1v))
+      fc_array = np.zeros(np.size(x1v))
     if self.passive:
       r_array = np.zeros(np.size(x1v))
 
@@ -283,46 +295,60 @@ class Plot1d:
         + '.athdf')
       time = float('{0:f}'.format(data['Time']))
       rho_array = data['rho'][0, 0, :]
+      v_array = data['vel1'][0, 0, :]
       if not self.isothermal:
         pg_array = data['press'][0, 0, :]
       if self.cr:
         ecr_array = data['Ec'][0, 0, :]
+        fc_array = data['Fc1'][0, 0, :]*self.vmax
       if self.passive:
         r_array = data['r0'][0, 0, :]
 
       # Plot and save image 
       if (self.isothermal and (not self.cr)):
-        fig = plt.figure(figsize=(4, 4))
-        grids = gs.GridSpec(1, 1, figure=fig)
+        fig = plt.figure(figsize=(6, 3))
+        grids = gs.GridSpec(1, 2, figure=fig)
         ax1 = fig.add_subplot(grids[0, 0])
-        lab = ['$\\rho$']
+        ax2 = fig.add_subplot(grids[0, 1])
+        lab = ['$\\rho$', '$v$']
         ax1.plot(x1v, rho_array - rho_eq, label='t={:.3f}'.format(time))
+        ax2.plot(x1v, v_array - v_eq, label='t={:.3f}'.format(time))
       elif ((not self.isothermal) and (not self.cr)):
-        fig = plt.figure(figsize=(8, 4))
-        grids = gs.GridSpec(1, 2, figure=fig)
-        ax1 = fig.add_subplot(grids[0, 0])
-        ax2 = fig.add_subplot(grids[0, 1])
-        lab = ['$\\rho$', '$P_g$']
-        ax1.plot(x1v, rho_array - rho_eq, label='t={:.3f}'.format(time))
-        ax2.plot(x1v, pg_array - pg_eq, label='t={:.3f}'.format(time))
-      elif (self.isothermal and self.cr):
-        fig = plt.figure(figsize=(8, 4))
-        grids = gs.GridSpec(1, 2, figure=fig)
-        ax1 = fig.add_subplot(grids[0, 0])
-        ax2 = fig.add_subplot(grids[0, 1])
-        lab = ['$\\rho$', '$P_c$']
-        ax1.plot(x1v, rho_array - rho_eq, label='t={:.3f}'.format(time))
-        ax2.plot(x1v, ecr_array/3. - pc_eq, label='t={:.3f}'.format(time))
-      elif ((not self.isothermal) and self.cr):
-        fig = plt.figure(figsize=(12, 4))
+        fig = plt.figure(figsize=(9, 3))
         grids = gs.GridSpec(1, 3, figure=fig)
         ax1 = fig.add_subplot(grids[0, 0])
         ax2 = fig.add_subplot(grids[0, 1])
         ax3 = fig.add_subplot(grids[0, 2])
-        lab = ['$\\rho$', '$P_c$', '$P_g$']
+        lab = ['$\\rho$', '$v$', '$P_g$']
         ax1.plot(x1v, rho_array - rho_eq, label='t={:.3f}'.format(time))
-        ax2.plot(x1v, ecr_array/3. - pc_eq, label='t={:.3f}'.format(time))
+        ax2.plot(x1v, v_array - v_eq, label='t={:.3f}'.format(time))
         ax3.plot(x1v, pg_array - pg_eq, label='t={:.3f}'.format(time))
+      elif (self.isothermal and self.cr):
+        fig = plt.figure(figsize=(12, 3))
+        grids = gs.GridSpec(1, 4, figure=fig)
+        ax1 = fig.add_subplot(grids[0, 0])
+        ax2 = fig.add_subplot(grids[0, 1])
+        ax3 = fig.add_subplot(grids[0, 2])
+        ax4 = fig.add_subplot(grids[0, 3])
+        lab = ['$\\rho$', '$v$', '$P_c$', '$F_c$']
+        ax1.plot(x1v, rho_array - rho_eq, label='t={:.3f}'.format(time))
+        ax2.plot(x1v, v_array - v_eq, label='t={:.3f}'.format(time))
+        ax3.plot(x1v, ecr_array/3. - pc_eq, label='t={:.3f}'.format(time))
+        ax4.plot(x1v, fc_array - fc_eq, label='t={:.3f}'.format(time))
+      elif ((not self.isothermal) and self.cr):
+        fig = plt.figure(figsize=(12, 3))
+        grids = gs.GridSpec(1, 5, figure=fig)
+        ax1 = fig.add_subplot(grids[0, 0])
+        ax2 = fig.add_subplot(grids[0, 1])
+        ax3 = fig.add_subplot(grids[0, 2])
+        ax4 = fig.add_subplot(grids[0, 3])
+        ax5 = fig.add_subplot(grids[0, 4])
+        lab = ['$\\rho$', '$v$', '$P_c$', '$P_g$', '$F_c$']
+        ax1.plot(x1v, rho_array - rho_eq, label='t={:.3f}'.format(time))
+        ax2.plot(x1v, v_array - v_eq, label='t={:.3f}'.format(time))
+        ax3.plot(x1v, ecr_array/3. - pc_eq, label='t={:.3f}'.format(time))
+        ax4.plot(x1v, pg_array - pg_eq, label='t={:.3f}'.format(time))
+        ax5.plot(x1v, fc_array - fc_eq, label='t={:.3f}'.format(time))
       else:
         pass
 
@@ -335,15 +361,28 @@ class Plot1d:
         axes.legend(frameon=False)
         axes.set_xlabel('$x$')
         axes.set_ylabel(lab[i])
-        axes.xaxis.set_minor_locator(AutoMinorLocator())
-        axes.yaxis.set_minor_locator(AutoMinorLocator())
+        if logx:
+          axes.set_xscale('log')
+        if logy and (axes != ax2):
+          if not self.isothermal:
+            axes.set_yscale('log')
+          elif (axes != ax5):
+            axes.set_yscale('log')
+        if not(logx or logy):
+          axes.xaxis.set_minor_locator(AutoMinorLocator())
+          axes.yaxis.set_minor_locator(AutoMinorLocator())
 
       if self.passive:
         ax_passive.legend(frameon=False)
         ax_passive.set_xlabel('$x$')
         ax_passive.set_ylabel('$r$')
-        ax_passive.xaxis.set_minor_locator(AutoMinorLocator())
-        ax_passive.yaxis.set_minor_locator(AutoMinorLocator())
+        if logx:
+          axes.set_xscale('log')
+        if logy:
+          axes.set_yscale('log')
+        if not(logx or logy):
+          ax_passive.xaxis.set_minor_locator(AutoMinorLocator())
+          ax_passive.yaxis.set_minor_locator(AutoMinorLocator())
         fig_passive.tight_layout()
 
       fig.tight_layout()
@@ -355,7 +394,7 @@ class Plot1d:
       plt.close('all')
     return 
 
-  def plot(self):
+  def plot(self, logx=False, logy=False):
     file_array = self.file_array 
     time_array = self.time_array
     x1v = self.x1v
@@ -391,7 +430,7 @@ class Plot1d:
       ax.append(ax8)
       ax.append(ax9)
       lab.append('$\\beta$')
-      lab.append('$P_g/\\rho^{\\gamma_g}$')
+      lab.append('$T$')
 
     if self.passive:
       fig_passive = plt.figure()
@@ -408,9 +447,11 @@ class Plot1d:
           ax5.plot(x1v, self.fcx_array[i, :]*vmax, 'k--', label='t={:.3f}'.format(time_array[i]))
           ax6.plot(x1v, self.vs_array[i, :], 'k--',  label='t={:.3f}'.format(time_array[i]))
           ax7.semilogy(x1v, self.sigma_adv_array[i, :]/(self.sigma_adv_array[i, :]/self.sigma_diff_array[i, :] + 1.)/vmax, 'k--', label='t={:.3f}'.format(time_array[i]))
-        if self.b_field:
+        if self.b_field and (not self.isothermal):
           ax8.plot(x1v, 2.*self.pg_array[i, :]/self.b0**2, 'k--', label='t={:.3f}'.format(time_array[i]))
-          ax9.plot(x1v, self.pg_array[i, :]/self.rho_array[i, :]**(gg), 'k--', label='t={:.3f}'.format(time_array[i]))
+          ax9.plot(x1v, self.pg_array[i, :]/self.rho_array[i, :], 'k--', label='t={:.3f}'.format(time_array[i]))
+        elif self.b_field and self.isothermal:
+          ax8.plot(x1v, 2.*self.cs_iso**2*self.rho_array[i, :]/self.b0**2, 'k--', label='t={:.3f}'.format(time_array[i]))
         if self.passive:
           ax_passive.plot(x1v, self.r_array[i, :], 'k--', label='t={:3f}'.format(time_array[i]))
       else:
@@ -423,17 +464,24 @@ class Plot1d:
           ax5.plot(x1v, self.fcx_array[i, :]*vmax, 'o-', label='t={:.3f}'.format(time_array[i]))
           ax6.plot(x1v, self.vs_array[i, :], 'o-',  label='t={:.3f}'.format(time_array[i]))
           ax7.semilogy(x1v, self.sigma_adv_array[i, :]/(self.sigma_adv_array[i, :]/self.sigma_diff_array[i, :] + 1.)/vmax, 'o-', label='t={:.3f}'.format(time_array[i]))
-        if self.b_field:
+        if self.b_field and (not self.isothermal):
           ax8.plot(x1v, 2.*self.pg_array[i, :]/self.b0**2, 'o-', label='t={:.3f}'.format(time_array[i]))
-          ax9.plot(x1v, self.pg_array[i, :]/self.rho_array[i, :]**(gg), 'o-', label='t={:.3f}'.format(time_array[i]))
+          ax9.plot(x1v, self.pg_array[i, :]/self.rho_array[i, :], 'o-', label='t={:.3f}'.format(time_array[i]))
+        elif self.b_field and self.isothermal:
+          ax8.plot(x1v, 2.*self.cs_iso**2*self.rho_array[i, :]/self.b0**2, 'o-', label='t={:.3f}'.format(time_array[i]))
         if self.passive:
           ax_passive.plot(x1v, self.r_array[i, :], label='t={:3f}'.format(time_array[i]))
 
     for i, axes in enumerate(ax):
-      axes.legend(frameon=False)
+      if not self.isothermal and not ax9:
+        axes.legend(frameon=False)
       axes.set_xlabel('$x$')
       axes.set_ylabel(lab[i])
-      if lab[i] != '$\\sigma_c$':
+      if logx and (axes != ax2) and (axes != ax5) and (axes != ax6) and (axes != ax7):
+        axes.set_xscale('log')
+      if logy and (axes != ax2) and (axes != ax5) and (axes != ax6) and (axes != ax7): 
+        axes.set_yscale('log')
+      if (not logx) and (not logy) and (lab[i] != '$\\sigma_c$'):
         axes.xaxis.set_minor_locator(AutoMinorLocator())
         axes.yaxis.set_minor_locator(AutoMinorLocator())
 
@@ -443,6 +491,8 @@ class Plot1d:
       ax_passive.legend(frameon=False)
       ax_passive.set_xlabel('$x$')
       ax_passive.set_ylabel('Concen.')
+      if logx and (axes != ax2) and (axes != ax5) and (axes != ax6) and (axes != ax7):
+        axes.set_xscale('log')
       fig_passive.tight_layout()
       return (fig, fig_passive)
 
@@ -684,7 +734,7 @@ class Plot1d:
     return fig
 
   # Count the number of stairs, stair height, stair width, stair plateau width
-  def staircase(self, plot=False, xlim=False, time_series=False, fit=False):
+  def staircase(self, plot=False, xlim=False, time_series=False, fit=False, inset=False):
     filename = self.filename 
 
     # Analyse only a specific region
@@ -715,6 +765,7 @@ class Plot1d:
       time_array[i] = float('{0:f}'.format(data['Time']))
       # For no mesh refinement
       x1v = np.array(data['x1v'])
+      dx = x1v[1] - x1v[0]
       if xlim:
         index_xl = np.argmin(np.abs(x1v - xl))
         index_xu = np.argmin(np.abs(x1v - xu)) + 1
@@ -724,6 +775,7 @@ class Plot1d:
       x1v = x1v[index_xl:index_xu]
       grids = np.size(x1v)
       dx = x1v[1] - x1v[0]
+      rho = data['rho'][0, 0, index_xl:index_xu]
       vx = data['vel1'][0, 0, index_xl:index_xu]
       pc = data['Ec'][0, 0, index_xl:index_xu]*(gc - 1.)
       fc = data['Fc1'][0, 0, index_xl:index_xu]*self.vmax
@@ -731,8 +783,12 @@ class Plot1d:
       kappa = (gc - 1.)*self.vmax/data['Sigma_diff1'][0, 0, index_xl:index_xu] 
       if time_series:
         if fp == file_avg:
+          rho_time_avg = rho/num_file_avg
+          v_time_avg = vx/num_file_avg
           pc_time_avg = pc/num_file_avg 
         elif fp > file_avg:
+          rho_time_avg += rho/num_file_avg
+          v_time_avg += vx/num_file_avg
           pc_time_avg += pc/num_file_avg
       dpcdx = np.gradient(pc, x1v)
       Lc = np.zeros(grids)
@@ -745,7 +801,8 @@ class Plot1d:
       L_equi = np.abs(self.profile_object.pc_sol/self.profile_object.dpcdx_sol)
       for j in np.arange(grids):
         # Condition 1: Fc has to be close enough to steady state Fc
-        if (dfcfc[j] < 100/self.vmax**2) and (Lc[j] < 5*L_equi[j]):
+        # if (dfcfc[j] < 100/self.vmax**2) and (Lc[j] < 5*L_equi[j]):
+        if (dx/Lc[j] > 0.01*np.abs(vs[j])/self.vmax):
           couple[j] = 1
         else:
           couple[j] = 0
@@ -824,6 +881,8 @@ class Plot1d:
     self.width = width_file
     self.height = height_file
     self.plateau = plateau_file
+    self.rho_time_avg = rho_time_avg
+    self.v_time_avg = v_time_avg
     self.pc_time_avg = pc_time_avg
 
     if plot:
@@ -843,8 +902,10 @@ class Plot1d:
         plt.show()
 
       time = float(input('Enter time to start performing statistics: '))
+      time_pc = float(input('Enter time to display pc staircase: '))
       display_file = file_array[np.argmin(np.abs(self.time_array - time))]
-      data = ar.athdf('./' + self.filename + '.out1.' + format(display_file, '05d') + '.athdf')
+      display_file_pc = file_array[np.argmin(np.abs(self.time_array - time_pc))]
+      data = ar.athdf('./' + self.filename + '.out1.' + format(display_file_pc, '05d') + '.athdf')
       x1v_display = np.array(data['x1v'])
       pc_display = data['Ec'][0, 0, :]*(gc - 1.)
 
@@ -860,7 +921,8 @@ class Plot1d:
       self.plateau_record = plateau_record 
       self.height_record = height_record
 
-      fig1 = plt.figure(figsize=(13, 6))
+      # fig1 = plt.figure(figsize=(13, 6))
+      fig1 = plt.figure()
       fig2 = plt.figure()
 
       grids = gs.GridSpec(1, 3, figure=fig2)
@@ -994,12 +1056,42 @@ class Plot1d:
         ax2.axvline(x=((stair.x1max - stair.x1min)/stair.nx1), color='r', linestyle='--')
         ax3.axvline(x=np.mean(pc)*((stair.x1max - stair.x1min)/stair.nx1)/np.mean(L), color='r', linestyle='--')
 
-      ax4.plot(x1v_display, pc_display, 'o-', label='t={:.3f}'.format(time))
+      ax4.plot(x1v_display, pc_display, 'o-')
       for i, x in enumerate(x1v_display[index_xl:index_xu]): 
-        if self.stair_start_loc[display_file][i] == 1: 
+        if self.stair_start_loc[display_file_pc][i] == 1: 
           ax4.axvline(x1v_display[index_xl+i], linestyle='--', color='g')
-        if self.stair_end_loc[display_file][i] == 1:
+        if self.stair_end_loc[display_file_pc][i] == 1:
           ax4.axvline(x1v_display[index_xl+i], linestyle='--', color='r')
+
+      if inset:
+        add_box = 'y'
+        ax_in_number = dict()
+        number = 1
+        while add_box == 'y':
+          name = 'ax_in{:d}'.format(number)
+          x_box = float(input('x location of the lower left corner: '))
+          y_box = float(input('y location of the lower left corner: '))
+          w_box = float(input('Width of the box: '))
+          h_box = float(input('Height of the box: '))
+          xlim_start = float(input('xlim start: '))
+          xlim_end = float(input('xlim end: '))
+          ylim_start = float(input('ylim start: '))
+          ylim_end = float(input('ylim end: '))
+          ax_in_number[name] = ax4.inset_axes([x_box, y_box, w_box, h_box], transform=ax4.transData)
+          ax_in_number[name].plot(x1v_display, pc_display, 'o-')
+          for i, x in enumerate(x1v_display[index_xl:index_xu]): 
+            if self.stair_start_loc[display_file_pc][i] == 1: 
+              ax_in_number[name].axvline(x1v_display[index_xl+i], linestyle='--', color='g')
+            if self.stair_end_loc[display_file_pc][i] == 1:
+              ax_in_number[name].axvline(x1v_display[index_xl+i], linestyle='--', color='r')
+          ax_in_number[name].set_xlim(xlim_start, xlim_end)
+          ax_in_number[name].set_ylim(ylim_start, ylim_end) 
+          ax_in_number[name].set_xticklabels('')
+          ax_in_number[name].set_yticklabels('')
+          ax4.indicate_inset_zoom(ax_in_number[name])
+          add_box = input('Want to add another box (y/n)?: ')
+          number += 1
+
 
       lab = ['Width', 'Plateau width', '$P_c$ Height']
 
@@ -1009,9 +1101,10 @@ class Plot1d:
         axes.set_xlabel(lab[i])
         axes.set_ylabel('Distribution')
         
-      ax4.legend(frameon=False)
+      ax4.margins(x=0)
       ax4.set_xlabel('$x$')
       ax4.set_ylabel('$P_c$')
+      ax4.set_title('$t={:.2f}$'.format(time_pc))
       ax4.xaxis.set_minor_locator(AutoMinorLocator())
       ax4.yaxis.set_minor_locator(AutoMinorLocator())
 
@@ -1021,13 +1114,22 @@ class Plot1d:
       if time_series:
         fig3 = plt.figure()
         fig4 = plt.figure()
+        fig5 = plt.figure()
         ax5 = fig3.add_subplot(111)
         ax6 = fig4.add_subplot(111)
+        ax7 = fig5.add_subplot(111)
 
         for i, key in enumerate(self.num_stair.keys()):
           ax5.scatter(stair.time_array[i], stair.num_stair[key], color='b')
 
+        ax6.plot(self.profile_object.x_sol, self.profile_object.pc_sol, 'k--', label='$t=0$')
         ax6.plot(x1v, pc_time_avg, label='$\\langle P_c \\rangle$')
+
+        if self.with_v:
+          ax7.plot(self.profile_object.x_sol, self.profile_object.v_sol, 'k--', label='$t=0$')
+        else:
+          ax7.plot(x1v, np.zeros(np.size(x1v)), 'k--', label='$t=0$')
+        ax7.plot(x1v, v_time_avg, label='$\\langle v \\rangle$')
 
         ax5.set_xlabel('Time')
         ax5.set_ylabel('Number of stairs')
@@ -1039,20 +1141,32 @@ class Plot1d:
         ax6.xaxis.set_minor_locator(AutoMinorLocator())
         ax6.yaxis.set_minor_locator(AutoMinorLocator())
 
+        ax7.set_xlabel('$x$')
+        ax7.set_ylabel('$v$')
+        ax7.xaxis.set_minor_locator(AutoMinorLocator())
+        ax7.yaxis.set_minor_locator(AutoMinorLocator())
+
         fig3.tight_layout()
         fig4.tight_layout()
-        return [fig1, fig2, fig3, fig4]
+        fig5.tight_layout()
+
+        plotdefault()
+
+        return [fig1, fig2, fig3, fig4, fig5]
+
 
       return [fig1, fig2]
     return
 
-  def convexhull(self, xlim=False, plot=False):
+  def convexhull(self, xlim=False, plot=False, xlog=False, ylog=False):
     filename = self.filename 
 
     # Analyse only a specific region
     if xlim:
       xl = float(input('Enter starting x for staircase analysis: '))
       xu = float(input('Enter ending x for staircase analysis: '))
+      xv_start = float(input('Start recording the velocity here: '))
+      xv_end = float(input('End recording the velocity here: '))
 
     # Choosing files for display
     file_array = self.file_array 
@@ -1081,11 +1195,30 @@ class Plot1d:
       x1v = x1v[index_xl:index_xu]
       grids = np.size(x1v)
       dx = x1v[1] - x1v[0]
-      rho = data['rho'][0, 0, index_xl:index_xu]
+      if self.with_v:
+        b0 = data['Bcc1'][0, 0, 0]
+        r = data['rho'][0, 0, index_xl:index_xu]
+        vel = data['vel1'][0, 0, index_xl:index_xu]
+        pg = data['press'][0, 0, index_xl:index_xu]
+        if xlim:
+          index_xv_start = np.argmin(np.abs(x1v - xv_start))
+          index_xv_end = np.argmin(np.abs(x1v - xv_end))
+          r_xv = r[index_xv_start:index_xv_end]
+          pg_xv = pg[index_xv_start:index_xv_end]
+          speed_sound = np.sqrt(gg*np.mean(pg_xv)/np.mean(r_xv))
+          vel = vel + speed_sound
+
+        rho = 1./(vel + b0/np.sqrt(r))
+        plt.plot(x1v, rho)
+        plt.show()
+      else:
+        rho = data['rho'][0, 0, index_xl:index_xu]
       pc = data['Ec'][0, 0, index_xl:index_xu]*(gc - 1)
       rho_max = np.amax(rho)
       rho_min = np.amin(rho)
       pc_max = np.amax(pc)
+      if np.argmax(rho) != 0:
+        rho[0] = rho_max
       num_rhobin = self.nx1
       rho_level = np.linspace(rho_max, rho_min, num_rhobin)
       loc_stair = np.array([], dtype=int)
@@ -1109,9 +1242,13 @@ class Plot1d:
       loc_stair = np.sort(loc_stair)
       x_stair[fp] = x1v[loc_stair]
       rho_stair[fp] = rho[loc_stair]
-      fit_pc = lambda pc0: np.sum(pc0*(rho_stair[fp]/rho_max)**(gc/2.) - pc[loc_stair])**2
+      if self.with_v:
+        fit_pc = lambda pc0: np.sum(pc0*(rho_stair[fp]/rho_max)**(gc) - pc[loc_stair])**2
+      else:
+        fit_pc = lambda pc0: np.sum(pc0*(rho_stair[fp]/rho_max)**(gc/2.) - pc[loc_stair])**2
       pc_fit = opt.minimize(fit_pc, pc_max)
-      pc_stair[fp] = pc_fit.x[0]*(rho_stair[fp]/rho_max)**(gc/2.)
+      # pc_stair[fp] = pc_fit.x[0]*(rho_stair[fp]/rho_max)**(gc/2.) if not self.with_v else pc_fit.x[0]*(rho_stair[fp]/rho_max)**(gc)
+      pc_stair[fp] = pc_max*(rho_stair[fp]/rho_max)**(gc/2.) if not self.with_v else pc_max*(rho_stair[fp]/rho_max)**(gc)
       x_ori[fp] = x1v 
       rho_ori[fp] = rho 
       pc_ori[fp] = pc
@@ -1145,14 +1282,20 @@ class Plot1d:
       ax2.scatter(x_ori[file], pc_ori[file], label='t={:.3f}'.format(time))
       ax2.plot(x_stair[file], pc_stair[file], 'k--')
 
-      lab = ['$\\rho$', '$P_c$']
+      lab = ['$\\rho$', '$P_c$'] if not self.with_v else ['$(v + v_A)^{-1}$', '$P_c$']
 
       for i, axes in enumerate(ax):
+        if xlog:
+          axes.set_xscale('log')
+        if ylog:
+          axes.set_yscale('log')
         axes.legend(frameon=False)
         axes.set_xlabel('$x$')
         axes.set_ylabel(lab[i])
-        axes.xaxis.set_minor_locator(AutoMinorLocator())
-        axes.yaxis.set_minor_locator(AutoMinorLocator())
+        if not xlog:
+          axes.xaxis.set_minor_locator(AutoMinorLocator())
+        if not ylog:
+          axes.yaxis.set_minor_locator(AutoMinorLocator())
 
       fig1.tight_layout()
       fig2.tight_layout()
@@ -1172,12 +1315,14 @@ class Plot1d:
 
     x_hist = np.zeros(np.size(file_array))
     den_hist = np.zeros(np.size(file_array))
+    v_hist = np.zeros(np.size(file_array))
     mom_hist = np.zeros(np.size(file_array)) 
     kin_hist = np.zeros(np.size(file_array))
     if not self.isothermal:
       therm_hist = np.zeros(np.size(file_array))
     if self.cr:
       ec_hist = np.zeros(np.size(file_array))
+      fc_hist = np.zeros(np.size(file_array))
 
     for i, fp in enumerate(file_array):
       print(fp)
@@ -1192,26 +1337,148 @@ class Plot1d:
         pg = data['press'][0, 0, :]
       if self.cr:
         ec = data['Ec'][0, 0, :] 
+        fc = data['Fc1'][0, 0, :]*self.vmax
       passive_count = np.where(r > 0.5)[0]
       x_hist[i] = np.mean(x1v[passive_count])
       den_hist[i] = np.mean(rho[passive_count])
+      v_hist[i] = np.mean(vx[passive_count])
       mom_hist[i] = np.mean(rho[passive_count]*vx[passive_count]) 
       kin_hist[i] = np.mean(0.5*rho[passive_count]*vx[passive_count]**2) 
       if not self.isothermal:
         therm_hist[i] = np.mean(pg[passive_count]/(gg - 1.))
       if self.cr:
         ec_hist[i] = np.mean(ec[passive_count])
+        fc_hist[i] = np.mean(fc[passive_count])
 
     # Save data
     self.time_array = time_array
     self.x_hist = x_hist
     self.den_hist = den_hist 
+    self.v_hist = v_hist
     self.mom_hist = mom_hist 
     self.kin_hist = kin_hist 
     if not self.isothermal:
       self.therm_hist = therm_hist
     if self.cr:
       self.ec_hist = ec_hist
+      self.fc_hist = fc_hist
+
+    if plot:
+      fig = plt.figure()
+      # fig = plt.figure(figsize=(12, 4))
+      grids = gs.GridSpec(2, 3, figure=fig)
+      ax1 = fig.add_subplot(grids[0, 0])
+      ax2 = fig.add_subplot(grids[0, 1])
+      ax3 = fig.add_subplot(grids[0, 2])
+      ax4 = fig.add_subplot(grids[1, 0])
+      ax5 = fig.add_subplot(grids[1, 1])
+      ax6 = fig.add_subplot(grids[1, 2])
+
+      lab = ['$x$', '$\\langle\\rho v\\rangle$', '$\\langle E_\\mathrm{kin} \\rangle$', '$\\langle E_\\mathrm{th} \\rangle$', '$\\langle E_\\mathrm{c} \\rangle$', '$E$']
+
+      ax1.plot(time_array, x_hist)
+      ax2.plot(time_array, mom_hist)
+      ax3.plot(time_array, kin_hist)
+      if not self.isothermal:
+        ax4.plot(time_array, therm_hist)
+      ax5.plot(time_array, ec_hist)
+      ax6.semilogy(time_array, kin_hist, label='$\\langle E_\\mathrm{kin} \\rangle$')
+      if not self.isothermal:
+        ax6.semilogy(time_array, therm_hist, label='$\\langle E_\\mathrm{th} \\rangle$')
+      ax6.semilogy(time_array, ec_hist, label='$\\langle E_\\mathrm{c} \\rangle$')
+
+      for i, axes in enumerate(fig.axes):
+        axes.set_xlabel('t')
+        axes.set_ylabel(lab[i])
+        axes.margins(x=0)
+        if axes == ax6:
+          axes.legend(frameon=False)
+        else:
+          axes.xaxis.set_minor_locator(AutoMinorLocator())
+          axes.yaxis.set_minor_locator(AutoMinorLocator())
+
+      # Second plot
+      fig2 = plt.figure()
+      # fig2 = plt.figure(figsize=(8, 4))
+      grids2 = gs.GridSpec(2, 2, figure=fig2)
+      ax21 = fig2.add_subplot(grids2[0, 0])
+      ax22 = fig2.add_subplot(grids2[0, 1])
+      ax23 = fig2.add_subplot(grids2[1, 0])
+      ax24 = fig2.add_subplot(grids2[1, 1])
+
+      if not self.isothermal:
+        lab = ['$\\rho$', '$v$', '$P_g$', '$P_c$']
+      else:
+        lab = ['$\\rho$', '$v$', '$F_c$', '$P_c$']
+      ax21.plot(x_hist, den_hist)
+      ax22.plot(x_hist, v_hist)
+      if not self.isothermal:
+        ax23.plot(x_hist, (gg - 1.)*therm_hist)
+      elif self.cr:
+        ax23.plot(x_hist, fc_hist)
+      if self.cr:
+        ax24.plot(x_hist, (gc - 1.)*ec_hist)
+      if self.profile_object != None:
+        ax21.plot(self.profile_object.x_sol, self.profile_object.rho_sol, 'k--')
+        if self.with_v:
+          ax22.plot(self.profile_object.x_sol, self.profile_object.v_sol, 'k--')
+        else:
+          ax22.plot(self.profile_object.x_sol, np.zeros(np.size(self.profile_object.x_sol)), 'k--')
+        if not self.isothermal:
+          ax23.plot(self.profile_object.x_sol, self.profile_object.pg_sol, 'k--')
+        elif self.cr:
+          ax23.plot(self.profile_object.x_sol, self.profile_object.fc_sol, 'k--')
+        ax24.plot(self.profile_object.x_sol, self.profile_object.pc_sol, 'k--')
+
+      for i, axes in enumerate(fig2.axes):
+        axes.set_xlabel('x')
+        axes.set_ylabel(lab[i])
+        axes.margins(x=0)
+        axes.xaxis.set_minor_locator(AutoMinorLocator())
+        axes.yaxis.set_minor_locator(AutoMinorLocator())
+
+      fig.tight_layout()
+      fig2.tight_layout()
+    return [fig, fig2]
+
+  def history2(self, start, plot=False):
+    filename = self.filename 
+    file_array = self.file_array 
+    time_array = np.zeros(np.size(file_array))
+
+    x_hist = np.zeros(np.size(file_array))
+    den_hist = np.zeros(np.size(file_array))
+    v_hist = np.zeros(np.size(file_array))
+    mom_hist = np.zeros(np.size(file_array)) 
+    kin_hist = np.zeros(np.size(file_array))
+    if not self.isothermal:
+      therm_hist = np.zeros(np.size(file_array))
+    if self.cr:
+      ec_hist = np.zeros(np.size(file_array))
+
+    for i, fp in enumerate(file_array):
+      print(fp)
+      data = ar.athdf('./' + filename + '.out1.' + format(fp, '05d') \
+        + '.athdf')
+      time_array[i] = float('{0:f}'.format(data['Time']))
+      x1v = data['x1v']
+      x_index = np.argmin(np.abs(x1v - start)) if (i == 0) else np.argmin(np.abs(x1v - x))
+      x_hist[i] = x1v[x_index]
+      rho = data['rho'][0, 0, x_index]
+      vx = data['vel1'][0, 0, x_index]
+      if not self.isothermal:
+        pg = data['press'][0, 0, x_index]
+      if self.cr:
+        ec = data['Ec'][0, 0, x_index] 
+      x = start + vx*self.dt if (i == 0) else x + vx*self.dt
+      den_hist[i] = rho 
+      v_hist[i] = vx 
+      mom_hist[i] = rho*vx 
+      kin_hist[i] = 0.5*rho*vx**2 
+      if not self.isothermal:
+        therm_hist[i] = pg/(gg - 1.)
+      if self.cr:
+        ec_hist[i] = ec
 
     if plot:
       fig = plt.figure(figsize=(12, 4))
@@ -1228,10 +1495,12 @@ class Plot1d:
       ax1.plot(time_array, x_hist)
       ax2.plot(time_array, mom_hist)
       ax3.plot(time_array, kin_hist)
-      ax4.plot(time_array, therm_hist)
+      if not self.isothermal:
+        ax4.plot(time_array, therm_hist)
       ax5.plot(time_array, ec_hist)
       ax6.semilogy(time_array, kin_hist, label='$\\langle E_\\mathrm{kin} \\rangle$')
-      ax6.semilogy(time_array, therm_hist, label='$\\langle E_\\mathrm{th} \\rangle$')
+      if not self.isothermal:
+        ax6.semilogy(time_array, therm_hist, label='$\\langle E_\\mathrm{th} \\rangle$')
       ax6.semilogy(time_array, ec_hist, label='$\\langle E_\\mathrm{c} \\rangle$')
 
       for i, axes in enumerate(fig.axes):
@@ -1244,8 +1513,176 @@ class Plot1d:
           axes.xaxis.set_minor_locator(AutoMinorLocator())
           axes.yaxis.set_minor_locator(AutoMinorLocator())
 
+      # Second plot
+      fig2 = plt.figure(figsize=(8, 4))
+      grids2 = gs.GridSpec(2, 2, figure=fig2)
+      ax21 = fig2.add_subplot(grids2[0, 0])
+      ax22 = fig2.add_subplot(grids2[0, 1])
+      ax23 = fig2.add_subplot(grids2[1, 0])
+      ax24 = fig2.add_subplot(grids2[1, 1])
+
+      lab = ['$\\rho$', '$v$', '$P_g$', '$P_c$']
+      ax21.plot(x_hist, den_hist)
+      ax22.plot(x_hist, v_hist)
+      ax23.plot(x_hist, (gg - 1.)*therm_hist)
+      ax24.plot(x_hist, (gc - 1.)*ec_hist)
+      if self.profile_object != None:
+        ax21.plot(self.profile_object.x_sol, self.profile_object.rho_sol, 'k--')
+        ax22.plot(self.profile_object.x_sol, self.profile_object.v_sol, 'k--')
+        ax23.plot(self.profile_object.x_sol, self.profile_object.pg_sol, 'k--')
+        ax24.plot(self.profile_object.x_sol, self.profile_object.pc_sol, 'k--')
+
+      for i, axes in enumerate(fig2.axes):
+        axes.set_xlabel('x')
+        axes.set_ylabel(lab[i])
+        axes.margins(x=0)
+        axes.xaxis.set_minor_locator(AutoMinorLocator())
+        axes.yaxis.set_minor_locator(AutoMinorLocator())
+
       fig.tight_layout()
-    return fig
+      fig2.tight_layout()
+      return [fig, fig2]
+    return
+
+  def time_avg(self, plot=False, logx=False, logy=False, compare=False):
+    filename = self.filename
+    file_array = self.file_array 
+    num_file = np.size(file_array)
+
+    x_avg = ar.athdf('./' + filename + '.out1.' + format(file_array[0], '05d') + '.athdf')['x1v']
+    rho_avg = np.zeros(np.size(x_avg))
+    v_avg = np.zeros(np.size(x_avg))
+    if not self.isothermal:
+      pg_avg = np.zeros(np.size(x_avg))
+    if self.cr:
+      pc_avg = np.zeros(np.size(x_avg))
+      fc_avg = np.zeros(np.size(x_avg))
+      va_avg = np.zeros(np.size(x_avg))
+      sc_avg = np.zeros(np.size(x_avg))
+      ev_avg = np.zeros(np.size(x_avg))
+      steady_fc_avg = np.zeros(np.size(x_avg))
+      cr_pushing_avg = np.zeros(np.size(x_avg))
+      cr_heating_avg = np.zeros(np.size(x_avg))
+      invariant = np.zeros(np.size(x_avg))
+
+    if compare:
+      rho0 = np.zeros(np.size(x_avg))
+      v0 = np.zeros(np.size(x_avg))
+      if not self.isothermal:
+        pg0 = np.zeros(np.size(x_avg))
+      if self.cr:
+        pc0 = np.zeros(np.size(x_avg))
+        fc0 = np.zeros(np.size(x_avg))
+        va0 = np.zeros(np.size(x_avg))
+
+    for i, fp in enumerate(file_array):
+      print(fp)
+      data = ar.athdf('./' + filename + '.out1.' + format(fp, '05d') \
+        + '.athdf')
+      rho = data['rho'][0, 0, :]
+      vx = data['vel1'][0, 0, :]
+      if not self.isothermal:
+        pg = data['press'][0, 0, :]
+      if self.cr:
+        ec = data['Ec'][0, 0, :] 
+        fc = data['Fc1'][0, 0, :]*self.vmax
+        va = np.abs(data['Vc1'][0, 0, :])
+        ss = data['Sigma_adv1'][0, 0, :]/self.vmax
+        sd = data['Sigma_diff1'][0, 0, :]/self.vmax
+        sc = 1./(1./ss + 1./sd)
+      rho_avg += rho/num_file
+      v_avg += vx/num_file
+      if not self.isothermal:
+        pg_avg += pg/num_file
+      if self.cr:
+        pc_avg += ec*(gc - 1.)/num_file
+        fc_avg += fc/num_file
+        va_avg += va/num_file
+        sc_avg += sc/num_file
+        ev_avg += ec*vx/num_file
+        steady_fc_avg += gc*ec*(vx + va)/num_file 
+        cr_pushing_avg += -sc*(fc - gc*vx*ec)/num_file
+        cr_heating_avg += -(vx + va)*sc*(fc - gc*vx*ec)/num_file
+        invariant += (ec*(gc - 1.))*(vx + va)**(gc)/num_file
+      if i == 0:
+        rho0 = data['rho'][0, 0, :]
+        v0 = data['vel1'][0, 0, :]
+        if not self.isothermal:
+          pg0 = data['press'][0, 0, :]
+        if self.cr:
+          pc0 = data['Ec'][0, 0, :]*(gc - 1.)
+          fc0 = data['Fc1'][0, 0, :]*self.vmax
+          va0 = np.abs(data['Vc1'][0, 0, :])
+
+    # Save data
+    self.x_avg = x_avg 
+    self.rho_avg = rho_avg 
+    self.v_avg = v_avg 
+    if not self.isothermal:
+      self.pg_avg = pg_avg 
+    if self.cr:
+      self.pc_avg = pc_avg
+      self.fc_avg = fc_avg 
+      self.va_avg = va_avg
+      self.sc_avg = sc_avg
+      self.ev_avg = ev_avg
+      self.steady_fc_avg = steady_fc_avg
+      self.cr_pushing_avg = cr_pushing_avg
+      self.cr_heating_avg = cr_heating_avg
+      self.invariant = invariant
+
+    if plot:
+      fig = plt.figure()
+      grids = gs.GridSpec(2, 3, figure=fig) if not self.isothermal else gs.GridSpec(2, 2, figure=fig)
+      ax1 = fig.add_subplot(grids[0, 0])
+      ax2 = fig.add_subplot(grids[0, 1])
+      ax3 = fig.add_subplot(grids[1, 0])
+      ax4 = fig.add_subplot(grids[1, 1])
+      if not self.isothermal:
+        ax5 = fig.add_subplot(grids[1, 2])
+
+      lab = ['$\\rho$', '$v$', '$P_g$', '$P_c$', '$F_c$'] if not self.isothermal else ['$\\rho$', '$v$', '$F_c$', '$P_c$']
+
+      ax1.plot(x_avg, rho_avg)
+      ax2.plot(x_avg, v_avg)
+      if not self.isothermal:
+        ax3.plot(x_avg, pg_avg)
+      elif self.cr :
+        ax3.plot(x_avg, fc_avg)
+      if self.cr:
+        ax4.plot(x_avg, pc_avg)
+        if not self.isothermal:
+          ax5.plot(x_avg, fc_avg)
+
+      if compare:
+        ax1.plot(x_avg, rho0, 'k--')
+        ax2.plot(x_avg, v0, 'k--')
+        if not self.isothermal:
+          ax3.plot(x_avg, pg0, 'k--')
+        elif self.cr:
+          ax3.plot(x_avg, fc0, 'k--')
+        if self.cr:
+          ax4.plot(x_avg, pc0, 'k--')
+          if not self.isothermal:
+            ax5.plot(x_avg, fc0, 'k--')
+
+      for i, axes in enumerate(fig.axes):
+        if logx and (axes != ax2) and (axes != ax5):
+          axes.set_xscale('log')
+        else:
+          axes.xaxis.set_minor_locator(AutoMinorLocator())
+        if logy and (axes != ax2) and (axes != ax5):
+          axes.set_yscale('log')
+        else:
+          axes.yaxis.set_minor_locator(AutoMinorLocator())
+        axes.margins(x=0)
+        axes.set_xlabel('$x$')
+        axes.set_ylabel(lab[i])
+
+      fig.tight_layout()
+      return fig
+    return
+      
 # End of class Plot1d
 
 
@@ -1365,31 +1802,581 @@ class Power:
     return
 
 # End of Power class
+
+
+
+class Power_iso:
+  def __init__(self, profile_input):
+    alpha = profile_input['alpha']
+    beta = profile_input['beta']
+    eta = profile_input['eta']
+    psi = profile_input['psi']
+    rho0 = profile_input['rho0']
+    cs0 = profile_input['cs0']
+    r0 = profile_input['r0']
+    self.alpha = alpha # pc_h/pg_h
+    self.beta = beta # 2*pg_h/b^2
+    self.eta = eta # kappa/gc L c_s
+    self.psi = psi 
+    self.phi = (gc/(2. - gc))*(1. - psi)
+    self.rho0 = rho0 
+    self.cs0 = cs0 
+    self.r0 = r0 
+    self.pg0 = cs0**2*rho0
+    self.pc0 = alpha*self.pg0 
+    self.b = np.sqrt(2.*self.pg0/beta)
+    self.cc0 = np.sqrt(gc*self.pc0/rho0)
+    self.va0 = self.b/np.sqrt(rho0)
+    self.Lc0 = r0/self.phi
+    self.kappa = eta*gc*self.Lc0*self.cs0 
+    self.ldiff = self.kappa/self.cs0
+  # End of init
+
+  def pc(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    cr_press = pc0*(x/r0)**(-phi)
+    return cr_press
+
+  def dpcdx(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    grad = -(phi*pc0/r0)*(x/r0)**(-phi - 1.)
+    return grad
+
+  def d2pcdx2(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    grad2 = (phi*(phi + 1.)*pc0/r0**2)*(x/r0)**(-phi - 2.)
+    return grad2 
+
+  def rho_st(self, x):
+    rho0 = self.rho0 
+    pc0 = self.pc0 
+    rho = rho0*(self.pc(x)/pc0)**(2./gc)
+    return rho
+
+  def powerprofile(self, xmin, xmax, grids):
+    kappa = self.kappa 
+    b = self.b
+    cs0 = self.cs0
+    va0 = self.va0
+    r0 = self.r0
+
+    func = lambda x, va: (kappa*self.d2pcdx2(x) - va*self.dpcdx(x))/(gc*self.pc(x))
+
+    dx = (xmax - xmin)/grids 
+    x_eval = np.zeros(grids)
+    x_eval[0] = xmin + 0.5*dx 
+    for i in np.arange(np.size(x_eval) - 1):
+      x_eval[i+1] = x_eval[i] + dx 
+    index = np.argmin(np.abs(x_eval - r0))
+    index = index if (x_eval[index] > r0) else index + 1
+
+    sol_front = integrate.solve_ivp(func, (r0, x_eval[-1]), [va0], t_eval=x_eval[index:])
+    if not index == 0:
+      sol_back = integrate.solve_ivp(func, (r0, x_eval[0]), [va0], t_eval=x_eval[0:index][::-1])
+      va_sol = np.append(sol_back.y[0][::-1], sol_front.y[0])
+    else:
+      va_sol = sol_front.y[0]
+
+    rho_sol = (b/va_sol)**2
+    pg_sol = cs0**2*rho_sol
+    pc_sol = self.pc(x_eval)
+    fc_sol = gc1*pc_sol*va_sol - (kappa/(gc - 1.))*self.dpcdx(x_eval)
+    dpgdx_sol = cs0**2*rho_sol*(va_sol*self.dpcdx(x_eval) - kappa*self.d2pcdx2(x_eval))/(gc*pc_sol*0.5*va_sol)
+    g_sol = (dpgdx_sol + self.dpcdx(x_eval))/rho_sol
+
+    # Save data
+    self.dx = dx
+    self.xmin = xmin
+    self.xmax = xmax
+    self.x_sol = x_eval
+    self.va_sol = va_sol 
+    self.rho_sol = rho_sol
+    self.pg_sol = pg_sol
+    self.dpgdx_sol = dpgdx_sol
+    self.pc_sol = pc_sol
+    self.dpcdx_sol = self.dpcdx(x_eval)
+    self.fc_sol = fc_sol 
+    self.g_sol = g_sol
+
+    return
+
+# End of Power_iso class
+
+
+
+class Power_v:
+  def __init__(self, profile_input):
+    alpha = profile_input['alpha']
+    beta = profile_input['beta']
+    eta = profile_input['eta']
+    ms = profile_input['ms']
+    psi = profile_input['psi']
+    rho0 = profile_input['rho0']
+    pg0 = profile_input['pg0']
+    r0 = profile_input['r0']
+    self.alpha = alpha # pc_h/pg_h
+    self.beta = beta # 2*pg_h/b^2
+    self.eta = eta # kappa/gc L c_s
+    self.ms = ms # v/cs sonic mach number, must be greater than 0
+    self.psi = psi 
+    self.phi = (gc/(2. - gc))*(1. - psi)
+    self.rho0 = rho0 
+    self.pg0 = pg0 
+    self.r0 = r0 
+    self.pc0 = alpha*pg0 
+    self.b = np.sqrt(2.*pg0/beta)
+    self.cs0 = np.sqrt(gg*pg0/rho0)
+    self.cc0 = np.sqrt(gc*self.pc0/rho0)
+    self.va0 = self.b/np.sqrt(rho0)
+    self.v0 = ms*self.cs0
+    self.Lc0 = r0/self.phi
+    self.kappa = eta*gc*self.Lc0*self.cs0 
+    self.ldiff = self.kappa/self.cs0
+
+    if ms < 0.0:
+      raise ValueError('Use profile.py instead.')
+  # End of init
+
+  def pg(self, x):
+    pg0 = self.pg0
+    r0 = self.r0
+    phi = self.phi
+    pressure = pg0*(x/r0)**(-phi)
+    return pressure
+
+  def pc(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    cr_press = pc0*(x/r0)**(-phi)
+    return cr_press
+
+  def dpgdx(self, x):
+    pg0 = self.pg0
+    r0 = self.r0 
+    phi = self.phi 
+    grad = -(phi*pg0/r0)*(x/r0)**(-phi - 1.)
+    return grad
+
+  def dpcdx(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    grad = -(phi*pc0/r0)*(x/r0)**(-phi - 1.)
+    return grad
+
+  def d2pcdx2(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    grad2 = (phi*(phi + 1.)*pc0/r0**2)*(x/r0)**(-phi - 2.)
+    return grad2 
+
+  def powerprofile(self, xmin, xmax, grids):
+    kappa = self.kappa 
+    rho0 = self.rho0
+    b = self.b
+    va0 = self.va0
+    v0 = self.v0
+    r0 = self.r0
+
+    func = lambda x, vpva: (kappa*self.d2pcdx2(x) - vpva*self.dpcdx(x))/(gc*self.pc(x))
+
+    dx = (xmax - xmin)/grids 
+    x_eval = np.zeros(grids)
+    x_eval[0] = xmin + 0.5*dx
+    for i in np.arange(np.size(x_eval) - 1):
+      x_eval[i+1] = x_eval[i] + dx 
+    index = np.argmin(np.abs(x_eval - r0))
+    index = index if (x_eval[index] > r0) else index + 1
+
+    sol_front = integrate.solve_ivp(func, (r0, x_eval[-1]), [v0 + va0], t_eval=x_eval[index:])
+    if index != 0:
+      sol_back = integrate.solve_ivp(func, (r0, x_eval[0]), [v0 + va0], t_eval=x_eval[0:index][::-1])
+      vpva_sol = np.append(sol_back.y[0][::-1], sol_front.y[0])
+    else:
+      vpva_sol = sol_front.y[0]
+
+    # Find va from vpva_sol
+    va_sol = np.zeros(np.size(vpva_sol)) 
+    for i, vp_va in enumerate(vpva_sol):
+      va_sol[i] = 0.5*(-va0/v0 + np.sqrt((va0/v0)**2 + 4.*vp_va/v0))*va0
+
+    rho_sol = (b/va_sol)**2
+    v_sol = vpva_sol - va_sol 
+    dvdx_sol = np.gradient(v_sol, x_eval)
+    pg_sol = self.pg(x_eval)
+    pc_sol = self.pc(x_eval)
+    fc_sol = gc1*pc_sol*(v_sol + va_sol) - (kappa/(gc - 1.))*self.dpcdx(x_eval)
+    g_sol = (rho0*v0*dvdx_sol + self.dpgdx(x_eval) + self.dpcdx(x_eval))/rho_sol
+    H_sol = (v_sol*self.dpgdx(x_eval) + gg*pg_sol*dvdx_sol + (gg - 1.)*va_sol*self.dpcdx(x_eval))/(gg - 1.)
+
+    # Save data
+    self.dx = x_eval[1] - x_eval[0]
+    self.xmin = xmin
+    self.xmax = xmax
+    self.x_sol = x_eval
+    self.va_sol = va_sol 
+    self.rho_sol = rho_sol
+    self.v_sol = v_sol
+    self.dvdx_sol = dvdx_sol
+    self.pg_sol = pg_sol
+    self.pc_sol = pc_sol
+    self.dpcdx_sol = self.dpcdx(x_eval)
+    self.fc_sol = fc_sol 
+    self.g_sol = g_sol
+    self.H_sol = H_sol
+
+    return
+
+# End of Power_v class
+
+
+
+class Power_v_iso:
+  def __init__(self, profile_input):
+    alpha = profile_input['alpha']
+    beta = profile_input['beta']
+    eta = profile_input['eta']
+    ms = profile_input['ms']
+    psi = profile_input['psi']
+    rho0 = profile_input['rho0']
+    cs0 = profile_input['cs0']
+    r0 = profile_input['r0']
+    self.alpha = alpha # pc_h/pg_h
+    self.beta = beta # 2*pg_h/b^2
+    self.eta = eta # kappa/gc L c_s
+    self.ms = ms # v/cs sonic mach number, must be greater than 0
+    self.psi = psi 
+    self.phi = (gc/(2. - gc))*(1. - psi)
+    self.rho0 = rho0 
+    self.cs0 = cs0 
+    self.r0 = r0 
+    self.pg0 = cs0**2*rho0
+    self.pc0 = alpha*self.pg0 
+    self.b = np.sqrt(2.*self.pg0/beta)
+    self.cc0 = np.sqrt(gc*self.pc0/rho0)
+    self.va0 = self.b/np.sqrt(rho0)
+    self.v0 = ms*self.cs0
+    self.Lc0 = r0/self.phi
+    self.kappa = eta*gc*self.Lc0*self.cs0 
+    self.ldiff = self.kappa/self.cs0
+
+    if ms < 0.0:
+      raise ValueError('Use profile.py instead.')
+  # End of init
+
+  def pc(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    cr_press = pc0*(x/r0)**(-phi)
+    return cr_press
+
+  def dpcdx(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    grad = -(phi*pc0/r0)*(x/r0)**(-phi - 1.)
+    return grad
+
+  def d2pcdx2(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    grad2 = (phi*(phi + 1.)*pc0/r0**2)*(x/r0)**(-phi - 2.)
+    return grad2 
+
+  def powerprofile(self, xmin, xmax, grids):
+    kappa = self.kappa 
+    rho0 = self.rho0
+    b = self.b
+    cs0 = self.cs0
+    va0 = self.va0
+    v0 = self.v0
+    r0 = self.r0
+
+    func = lambda x, vpva: (kappa*self.d2pcdx2(x) - vpva*self.dpcdx(x))/(gc*self.pc(x))
+
+    dx = (xmax - xmin)/grids 
+    x_eval = np.zeros(grids)
+    x_eval[0] = xmin + 0.5*dx
+    for i in np.arange(np.size(x_eval) - 1):
+      x_eval[i+1] = x_eval[i] + dx 
+    index = np.argmin(np.abs(x_eval - r0))
+    index = index if (x_eval[index] > r0) else index + 1
+
+    sol_front = integrate.solve_ivp(func, (r0, x_eval[-1]), [v0 + va0], t_eval=x_eval[index:])
+    if index != 0:
+      sol_back = integrate.solve_ivp(func, (r0, x_eval[0]), [v0 + va0], t_eval=x_eval[0:index][::-1])
+      vpva_sol = np.append(sol_back.y[0][::-1], sol_front.y[0])
+    else:
+      vpva_sol = sol_front.y[0]
+
+    # Find va from vpva_sol
+    va_sol = np.zeros(np.size(vpva_sol)) 
+    for i, vp_va in enumerate(vpva_sol):
+      va_sol[i] = 0.5*(-va0/v0 + np.sqrt((va0/v0)**2 + 4.*vp_va/v0))*va0
+
+    rho_sol = (b/va_sol)**2
+    v_sol = vpva_sol - va_sol 
+    dvdx_sol = np.gradient(v_sol, x_eval)
+    pg_sol = cs0**2*rho_sol
+    pc_sol = self.pc(x_eval)
+    fc_sol = gc1*pc_sol*(v_sol + va_sol) - (kappa/(gc - 1.))*self.dpcdx(x_eval)
+    dpgdx_sol = cs0**2*rho_sol*(vpva_sol*self.dpcdx(x_eval) - kappa*self.d2pcdx2(x_eval))/(gc*pc_sol*(v_sol + 0.5*va_sol))
+    g_sol = (rho0*v0*dvdx_sol + dpgdx_sol + self.dpcdx(x_eval))/rho_sol
+
+    # Save data
+    self.dx = x_eval[1] - x_eval[0]
+    self.xmin = xmin
+    self.xmax = xmax
+    self.x_sol = x_eval
+    self.va_sol = va_sol 
+    self.rho_sol = rho_sol
+    self.v_sol = v_sol
+    self.dvdx_sol = dvdx_sol
+    self.pg_sol = pg_sol
+    self.dpgdx_sol = dpgdx_sol
+    self.pc_sol = pc_sol
+    self.dpcdx_sol = self.dpcdx(x_eval)
+    self.fc_sol = fc_sol 
+    self.g_sol = g_sol
+
+    return
+
+# End of Power_v_iso class
+
+
+
+class Power_v_cool:
+  def __init__(self, profile_input):
+    alpha = profile_input['alpha']
+    beta = profile_input['beta']
+    eta = profile_input['eta']
+    ms = profile_input['ms']
+    delta = profile_input['delta']
+    epsilon = profile_input['epsilon']
+    psi = profile_input['psi']
+    rho0 = profile_input['rho0']
+    cs0 = profile_input['cs0']
+    r0 = profile_input['r0']
+    self.alpha = alpha # pc_h/pg_h
+    self.beta = beta # 2*pg_h/b^2
+    self.eta = eta # kappa/gc L c_s
+    self.ms = ms # v/cs sonic mach number, must be greater than 0
+    self.delta = delta # t_cool/t_box
+    self.epsilon = epsilon
+    self.psi = psi 
+    self.phi = (gc/(2. - gc))*(1. - psi)
+    self.rho0 = rho0 
+    self.pg0 = pg0 
+    self.T0 = pg0/rho0
+    self.r0 = r0 
+    self.pc0 = alpha*pg0 
+    self.b = np.sqrt(2.*pg0/beta)
+    self.cs0 = np.sqrt(gg*pg0/rho0)
+    self.cc0 = np.sqrt(gc*self.pc0/rho0)
+    self.va0 = self.b/np.sqrt(rho0)
+    self.v0 = ms*self.cs0
+    self.Lc0 = r0/self.phi
+    self.kappa = eta*gc*self.Lc0*self.cs0 
+    self.ldiff = self.kappa/self.cs0
+    self.lambda0 = self.phi*pg0*self.cs0/((gg - 1.)*rho0**2*r0*delta)
+
+    if ms < 0.0:
+      raise ValueError('Use profile.py instead.')
+  # End of init
+
+  def pg(self, x):
+    pg0 = self.pg0
+    r0 = self.r0
+    phi = self.phi
+    pressure = pg0*(x/r0)**(-phi)
+    return pressure
+
+  def pc(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    cr_press = pc0*(x/r0)**(-phi)
+    return cr_press
+
+  def dpgdx(self, x):
+    pg0 = self.pg0
+    r0 = self.r0 
+    phi = self.phi 
+    grad = -(phi*pg0/r0)*(x/r0)**(-phi - 1.)
+    return grad
+
+  def dpcdx(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    grad = -(phi*pc0/r0)*(x/r0)**(-phi - 1.)
+    return grad
+
+  def d2pcdx2(self, x):
+    pc0 = self.pc0
+    r0 = self.r0
+    phi = self.phi
+    grad2 = (phi*(phi + 1.)*pc0/r0**2)*(x/r0)**(-phi - 2.)
+    return grad2 
+
+  def powerprofile(self, xmin, xmax, grids):
+    kappa = self.kappa 
+    rho0 = self.rho0
+    pg0 = self.pg0
+    b = self.b
+    va0 = self.va0
+    v0 = self.v0
+    r0 = self.r0
+    T0 = self.T0
+    epsilon = self.epsilon
+    lambda0 = self.lambda0 
+
+    func = lambda x, vpva: (kappa*self.d2pcdx2(x) - vpva*self.dpcdx(x))/(gc*self.pc(x))
+
+    dx = (xmax - xmin)/grids 
+    x_eval = np.zeros(grids)
+    x_eval[0] = xmin + 0.5*dx
+    for i in np.arange(np.size(x_eval) - 1):
+      x_eval[i+1] = x_eval[i] + dx 
+    index = np.argmin(np.abs(x_eval - r0))
+    index = index if (x_eval[index] > r0) else index + 1
+
+    sol_front = integrate.solve_ivp(func, (r0, x_eval[-1]), [v0 + va0], t_eval=x_eval[index:])
+    sol_back = integrate.solve_ivp(func, (r0, x_eval[0]), [v0 + va0], t_eval=x_eval[0:index][::-1])
+    vpva_sol = np.append(sol_back.y[0][::-1], sol_front.y[0])
+
+    # Find va from vpva_sol
+    va_sol = np.zeros(np.size(vpva_sol)) 
+    for i, vp_va in enumerate(vpva_sol):
+      va_sol[i] = 0.5*(-va0/v0 + np.sqrt((va0/v0)**2 + 4.*vp_va/v0))*va0
+
+    rho_sol = (b/va_sol)**2
+    v_sol = vpva_sol - va_sol 
+    pg_sol = self.pg(x_eval)
+    pc_sol = self.pc(x_eval)
+    fc_sol = gc1*pc_sol*(v_sol + va_sol) - (kappa/(gc - 1.))*self.dpcdx(x_eval)
+    dvdx_sol = -v_sol*(vpva_sol*self.dpcdx(x_eval) - kappa*self.d2pcdx2(x_eval))/(gc*pc_sol*(v_sol + 0.5*va_sol))
+    g_sol = (rho0*v0*dvdx_sol + self.dpgdx(x_eval) + self.dpcdx(x_eval))/rho_sol
+    T_sol = pg_sol/rho_sol 
+    cool_sol = lambda0*(T_sol/T0)**epsilon 
+    H_sol = (v_sol*self.dpgdx(x_eval) + gg*pg_sol*dvdx_sol + (gg - 1.)*va_sol*self.dpcdx(x_eval) + (gg - 1.)*rho_sol**2*cool_sol)/((gg - 1.)*rho_sol)
+
+    # Save data
+    self.dx = x_eval[1] - x_eval[0]
+    self.xmin = xmin
+    self.xmax = xmax
+    self.x_sol = x_eval
+    self.va_sol = va_sol 
+    self.rho_sol = rho_sol
+    self.v_sol = v_sol
+    self.dvdx_sol = dvdx_sol
+    self.pg_sol = pg_sol
+    self.pc_sol = pc_sol
+    self.fc_sol = fc_sol 
+    self.g_sol = g_sol
+    self.T_sol = T_sol
+    self.H_sol = H_sol
+
+    return
+
+# End Power_v_cool class
 ####################################
 inputfile = 'athinput.cr_power'
-file_array = np.array([0, 250]) 
+file_array = np.array([0, 5]) 
 
-# Background
+# # Background for static 
+# profile_in = dict()
+# profile_in['alpha'] = 0.1
+# profile_in['beta'] = 1.
+# profile_in['eta'] = 0.01
+# profile_in['psi'] = 0.
+
+# profile_in['rho0'] = 1. 
+# profile_in['pg0'] = 1. 
+# profile_in['r0'] = 1.
+
+# # Background for static iso
+# profile_in = dict()
+# profile_in['alpha'] = 1.
+# profile_in['beta'] = 1.
+# profile_in['eta'] = 0.01
+# profile_in['psi'] = 0.5
+
+# profile_in['rho0'] = 1. 
+# profile_in['cs0'] = 1. 
+# profile_in['r0'] = 1.
+
+# # Background for static cool
+# profile_in = dict()
+# profile_in['alpha'] = 1.
+# profile_in['beta'] = 1.
+# profile_in['eta'] = 0.01
+# profile_in['delta'] = 0.1
+# profile_in['epsilon'] = -2.
+# profile_in['psi'] = 0.
+
+# profile_in['rho0'] = 1. 
+# profile_in['pg0'] = 1. 
+# profile_in['r0'] = 1.
+
+# Background for v
 profile_in = dict()
 profile_in['alpha'] = 1.
 profile_in['beta'] = 1.
-profile_in['eta'] = 0.001
-profile_in['psi'] = 0.
+profile_in['eta'] = 0.01
+profile_in['ms'] = 0.08
+profile_in['psi'] = 0.5
 
 profile_in['rho0'] = 1. 
 profile_in['pg0'] = 1. 
 profile_in['r0'] = 1.
 
-one = Plot1d(inputfile, file_array, video=False, staircase=False, profile_in=profile_in)
-if one.passive:
-  fig, fig_pass = one.plot()
-  fig.savefig('./1dplot.png', dpi=300)
-  fig_pass.savefig('./1dplot_passive.png', dpi=300)
-else:
-  fig = one.plot()
-  fig.savefig('./1dplot.png', dpi=300)
-plt.show()
-plt.close('all')
+# # Background for v_iso
+# profile_in = dict()
+# profile_in['alpha'] = 1.
+# profile_in['beta'] = 1.
+# profile_in['eta'] = 0.01
+# profile_in['ms'] = 0.01
+# profile_in['psi'] = 0.
+
+# profile_in['rho0'] = 1. 
+# profile_in['cs0'] = 1. 
+# profile_in['r0'] = 1.
+
+# # Background for v_cool
+# profile_in = dict()
+# profile_in['alpha'] = 1.
+# profile_in['beta'] = 1.
+# profile_in['eta'] = 0.01
+# profile_in['ms'] = 0.05
+# profile_in['delta'] = 1.
+# profile_in['epsilon'] = -0.66667
+# profile_in['psi'] = 0.
+
+# profile_in['rho0'] = 1. 
+# profile_in['pg0'] = 1. 
+# profile_in['r0'] = 1.
+
+# one = Plot1d(inputfile, file_array, video=False, staircase=False, profile_in=None, with_v=False)
+# if one.passive:
+#   fig, fig_pass = one.plot(logx=False, logy=True)
+#   fig.savefig('./1dplot.png', dpi=300)
+#   fig_pass.savefig('./1dplot_passive.png', dpi=300)
+# else:
+#   fig = one.plot(logx=False, logy=True)
+#   fig.savefig('./1dplot.png', dpi=300)
+# plt.show()
+# plt.close('all')
 
 # one.shock()
 # shkfig = one.plotshock()
@@ -1411,60 +2398,80 @@ plt.close('all')
 # latexify(columns=1)
 # fig = plt.figure()
 # ax1 = fig.add_subplot(111)
+# ax1.plot(one.x1v, one.vx_array[0, :], 'k--')
 # ax1.plot(one.x1v, one.vx_array[1, :])
-# ax1.plot(x, amp, '--')
+# # ax1.plot(x, ma.masked_array(amp, np.abs(amp)>0.002), 'k--')
+# # ax1.plot(x, -ma.masked_array(amp, np.abs(amp)>0.002), 'k--')
 # ax1.margins(x=0)
+# ax1.set_xlim(1.35, 1.65)
+# ax1.set_ylim(-0.0042, 0.006)
 # ax1.set_xlabel('$x$')
 # ax1.set_ylabel('$v$')
 # fig.tight_layout()
-# fig.savefig('./amp_compare.png', dpi=300)
+# # fig.savefig('./amp_compare.png', dpi=300)
+# fig.savefig('./alpha1beta1eta_01psi0_gauss.png', dpi=300)
 # plt.show()
 # plt.close('all')
 # plotdefault()
 
 #################################
-# Make video
-# Equilibrium
-equi = {}
-equi['rho'] = 0.0
-equi['pc'] = 0.0
-equi['pg'] = 0.0
+# # Make video
+# # Equilibrium
+# equi = {}
+# equi['rho'] = 0.0
+# equi['v'] = 0.0
+# equi['pc'] = 0.0
+# equi['pg'] = 0.0
+# equi['fc'] = 0.0
 
-video_array = np.arange(300)
-video_path = '/Users/tsunhinnavintsung/Workspace/Codes/workspace/1dcr_v2_1/cr_acous/power/results/sims/output/video/'
-video = Plot1d(inputfile, video_array, video=True, staircase=False, profile_in=profile_in)
-video.make_video(equi, video_path)
+# comm = MPI.COMM_WORLD
+# size = comm.Get_size()
+# rank = comm.Get_rank()
+
+# file_start = 0
+# file_end = 1000
+
+# total_num_file = file_end - file_start 
+# each = total_num_file//size
+
+# video_array = np.arange(file_start + rank*each, file_start + (rank+1)*each)
+# video_path = '/Users/tsunhinnavintsung/Workspace/Codes/workspace/1dcr_v2_1/cr_acous/power/results/sims/output/video/'
+# video = Plot1d(inputfile, video_array, video=True, staircase=False, profile_in=None, with_v=True)
+# video.make_video(equi, video_path, logx=False, logy=True)
 
 ################################
 # # Staricase identification
 # # stair_array = np.array([311])
-# stair_array = np.arange(300)
-# stair = Plot1d(inputfile, stair_array, video=False, staircase=True, profile_in=profile_in)
-# plotdefault()
-# stairfig_stat, stairfig_pc, stairfig_time, stairfig_avgpc = stair.staircase(plot=True, xlim=False, time_series=True, fit=True)
+# stair_array = np.arange(1001)
+# stair = Plot1d(inputfile, stair_array, video=False, staircase=True, profile_in=profile_in, with_v=True)
+# latexify(columns=2)
+# stairfig_stat, stairfig_pc, stairfig_time, stairfig_avgpc, stairfig_avgv = stair.staircase(plot=True, xlim=False, time_series=True, fit=True, inset=False)
+# # plotdefault()
 # stairfig_stat.savefig('./staircase_stat.png', dpi=300)
 # stairfig_pc.savefig('./staircase_pc.png', dpi=300)
 # stairfig_time.savefig('./staircase_time.png', dpi=300) # Need to comment out if time_series=False
 # stairfig_avgpc.savefig('./staircase_avgpc.png', dpi=300) # Need to comment out if time_series=False
+# stairfig_avgv.savefig('./staircase_avgv.png', dpi=300) # Need to comment out if time_series=False
 
 # plt.show()
 # plt.close('all')
 
 ###############################
-# # Construct convex hull for density and reconstruct Pc
-# stair_array = np.array([150])
-# stair2 = Plot1d(inputfile, stair_array, video=False, staircase=True, profile_in=profile_in)
-# plotdefault()
-# stair2fig_rho, stair2fig_pc = stair2.convexhull(xlim=False, plot=True)
+# Construct convex hull for density and reconstruct Pc
+stair_array = np.array([766])
+stair2 = Plot1d(inputfile, stair_array, video=False, staircase=True, profile_in=profile_in, with_v=True)
+latexify(columns=1, square=True)
+stair2fig_rho, stair2fig_pc = stair2.convexhull(xlim=True, plot=True, xlog=False, ylog=True)
 
-# stair2fig_rho.savefig('./rho_hull.png', dpi=300)
-# stair2fig_pc.savefig('./pc_hull.png', dpi=300)
+stair2fig_rho.savefig('./rho_hull.png', dpi=300)
+stair2fig_pc.savefig('./pc_hull.png', dpi=300)
+plotdefault()
 
-# plt.show()
-# plt.close('all')
+plt.show()
+plt.close('all')
 
 ###############################
-# Staircase fitting
+# # Staircase fitting
 # try:
 #   with h5py.File('fit_record.hdf5', 'r+') as fp:
 #     eta_record = np.array(fp['eta'])
@@ -1544,15 +2551,244 @@ video.make_video(equi, video_path)
 #     fp.create_dataset('chi_height', data=chi_height_record)
 
 #####################################
-# History plot
-hist_array = np.arange(250)
-hist = Plot1d(inputfile, hist_array, video=False, staircase=False, history=True, profile_in=profile_in)
-histfig = hist.history(plot=True)
-histfig.savefig('./hist.png', dpi=300)
+# # History plot
+# hist_array = np.arange(1001)
+# hist = Plot1d(inputfile, hist_array, video=False, staircase=False, history=True, profile_in=profile_in, with_v=True)
+# latexify(columns=2)
+# histfigt, histfigx = hist.history(plot=True)
+# # histfigt, histfigx = hist.history2(start=1.1, plot=True)
+# histfigt.savefig('./hist_time.png', dpi=300)
+# histfigx.savefig('./hist_x.png', dpi=300)
+# plotdefault()
 
-plt.show()
-plt.close('all')
+# plt.show()
+# plt.close('all')
 
-#########################
-# Plots for publication
+######################################
+# # Time avg plot
+# avg_array = np.arange(0, 1000)
+# # avg_array = np.array([700])
+# avg = Plot1d(inputfile, avg_array, video=False, staircase=False, history=False, avg=True, profile_in=None, with_v=True)
+# avg.time_avg(plot=False)
+# avg_fig = avg.time_avg(plot=True, logx=False, logy=True, compare=True)
+# avg_fig.savefig('./time_avg.png', dpi=300)
 
+# plt.show()
+# plt.close()
+
+# # Parallel
+# comm = MPI.COMM_WORLD
+# size = comm.Get_size()
+# rank = comm.Get_rank()
+
+# avg_total_array = np.arange(0, 1000)
+# each = np.size(avg_total_array)//size
+
+# avg_array = avg_total_array[rank*each:(rank+1)*each]
+# avg = Plot1d(inputfile, avg_array, video=False, staircase=False, history=False, avg=True, profile_in=None, with_v=True)
+# avg.time_avg(plot=False)
+
+# # Combine values
+# avg_rho = np.zeros(np.size(avg.x_avg))
+# avg_v = np.zeros(np.size(avg.x_avg))
+# if not avg.isothermal:
+#   avg_pg = np.zeros(np.size(avg.x_avg))
+# if avg.cr:
+#   avg_pc = np.zeros(np.size(avg.x_avg))
+#   avg_fc = np.zeros(np.size(avg.x_avg))
+#   avg_va = np.zeros(np.size(avg.x_avg))
+#   avg_sc = np.zeros(np.size(avg.x_avg))
+#   avg_ev = np.zeros(np.size(avg.x_avg))
+#   avg_steady_fc = np.zeros(np.size(avg.x_avg))
+#   avg_cr_pushing = np.zeros(np.size(avg.x_avg))
+#   avg_cr_heating = np.zeros(np.size(avg.x_avg))
+#   invari = np.zeros(np.size(avg.x_avg))
+
+# comm.Reduce(avg.rho_avg*np.size(avg_array)/np.size(avg_total_array), avg_rho, op=MPI.SUM, root=0)
+# comm.Reduce(avg.v_avg*np.size(avg_array)/np.size(avg_total_array), avg_v, op=MPI.SUM, root=0)
+# if not avg.isothermal:
+#   comm.Reduce(avg.pg_avg*np.size(avg_array)/np.size(avg_total_array), avg_pg, op=MPI.SUM, root=0)
+# if avg.cr:
+#   comm.Reduce(avg.pc_avg*np.size(avg_array)/np.size(avg_total_array), avg_pc, op=MPI.SUM, root=0)
+#   comm.Reduce(avg.fc_avg*np.size(avg_array)/np.size(avg_total_array), avg_fc, op=MPI.SUM, root=0)
+#   comm.Reduce(avg.va_avg*np.size(avg_array)/np.size(avg_total_array), avg_va, op=MPI.SUM, root=0)
+#   comm.Reduce(avg.sc_avg*np.size(avg_array)/np.size(avg_total_array), avg_sc, op=MPI.SUM, root=0)
+#   comm.Reduce(avg.ev_avg*np.size(avg_array)/np.size(avg_total_array), avg_ev, op=MPI.SUM, root=0)
+#   comm.Reduce(avg.steady_fc_avg*np.size(avg_array)/np.size(avg_total_array), avg_steady_fc, op=MPI.SUM, root=0)
+#   comm.Reduce(avg.cr_pushing_avg*np.size(avg_array)/np.size(avg_total_array), avg_cr_pushing, op=MPI.SUM, root=0)
+#   comm.Reduce(avg.cr_heating_avg*np.size(avg_array)/np.size(avg_total_array), avg_cr_heating, op=MPI.SUM, root=0)
+#   comm.Reduce(avg.invariant*np.size(avg_array)/np.size(avg_total_array), invari, op=MPI.SUM, root=0)
+
+# # # video_path = '/Users/tsunhinnavintsung/Workspace/Codes/workspace/1dcr_v2_1/cr_acous/wind/results/sims/output/video/'
+# # # avg.fc_compare(video_path, logx=False, logy=True)
+
+# if rank == 0:
+#   avg.rho_avg = avg_rho 
+#   avg.v_avg = avg_v
+#   if not avg.isothermal:
+#     avg.pg_avg = avg_pg 
+#   if avg.cr:
+#     avg.pc_avg = avg_pc 
+#     avg.fc_avg = avg_fc 
+#     avg.va_avg = avg_va 
+#     avg.sc_avg = avg_sc 
+#     avg.ev_avg = avg_ev 
+#     avg.steady_fc_avg = avg_steady_fc 
+#     avg.cr_pushing_avg = avg_cr_pushing
+#     avg.cr_heating_avg = avg_cr_heating
+#     avg.invariant = invari
+
+#   x_vpva = (avg.v_avg + avg.va_avg)**(-gc)
+#   smooth_vpva = signal.savgol_filter(x_vpva, 31, 3)
+#   smooth_pc = signal.savgol_filter(avg.pc_avg, 31, 3)
+#   # dlogpcdcoup = np.gradient(np.log(avg.pc_avg), np.log(x_vpva))
+#   # dlogpcdcoup_delete = np.where(dlogpcdcoup < 0)[0]
+#   dlogpcdcoup = np.gradient(np.log(smooth_pc), np.log(smooth_vpva))
+#   dlogpcdcoup_delete = np.where(dlogpcdcoup < 0)[0]
+#   smooth_vpva = np.delete(smooth_vpva, dlogpcdcoup_delete)
+#   dlogpcdcoup = np.delete(dlogpcdcoup, dlogpcdcoup_delete)
+#   # dlogpcdcoup_smooth = signal.savgol_filter(dlogpcdcoup, 31, 3)
+#   fit = np.polyfit(np.log(smooth_vpva), dlogpcdcoup, deg=0)
+
+#   # x_rho = avg.rho_avg**(gc/2.)
+#   # dlogpcdcoup = np.gradient(np.log(avg.pc_avg), np.log(x_rho))
+#   # dlogpcdcoup_delete = np.where(dlogpcdcoup < 0)[0]
+#   # x_rho = np.delete(x_rho, dlogpcdcoup_delete)
+#   # dlogpcdcoup = np.delete(dlogpcdcoup, dlogpcdcoup_delete)
+#   # dlogpcdcoup_smooth = signal.savgol_filter(dlogpcdcoup, 31, 3)
+#   # fit = np.polyfit(np.log(x_rho), dlogpcdcoup, deg=0)
+
+#   plotdefault()
+
+#   fig = plt.figure()
+#   ax = fig.add_subplot(111)
+
+#   ax.loglog(smooth_vpva, dlogpcdcoup)
+#   # ax.loglog(x_rho, dlogpcdcoup)
+#   # ax.loglog(x_vpva, dlogpcdcoup_smooth, 'r')
+#   ax.axhline(1.0, color='k', linestyle='--')
+#   ax.axhline(fit[0], color='brown', linestyle=':')
+
+#   ax.margins(x=0)
+#   ax.set_xlabel('$(v + v_A)^{-\\gamma_c}$')
+#   # ax.set_xlabel('$\\rho^{\\gamma_c/2}$')
+#   ax.set_ylabel('$\\mathrm{dlog} P_c/\\mathrm{dlog} (v + v_A)^{-\\gamma_c}$')
+#   # ax.set_ylabel('$\\mathrm{dlog} P_c/\\mathrm{dlog} \\rho^{\\gamma_c/2}$')
+
+#   fig.tight_layout()
+#   plt.show()
+
+#   # Pc invariant
+#   # fit_invar = np.polyfit(avg.x_avg, avg.invariant, deg=1)
+#   # fit_invar2 = np.polyfit(avg.x_avg, avg.pc_avg*(avg.v_avg + avg.va_avg)**(gc), deg=1)
+#   # fit_push = np.polyfit(np.log(-np.gradient(avg.pc_avg, avg.x_avg)), np.log(-avg.cr_pushing_avg), deg=1)
+#   # fit_heat = np.polyfit(np.log(-(avg.v_avg + avg.va_avg)*np.gradient(avg.pc_avg, avg.x_avg)), np.log(-avg.cr_heating_avg), deg=1)
+
+#   fig1 = plt.figure()
+#   fig2 = plt.figure()
+#   fig3 = plt.figure()
+#   ax1 = fig1.add_subplot(111)
+#   ax2 = fig2.add_subplot(121)
+#   ax3 = fig2.add_subplot(122)
+#   ax4 = fig3.add_subplot(111)
+
+#   ax1.plot(avg.x_avg, avg.invariant, 'b', label='$\\langle P_c (v + v_A)^{\\gamma_c}\\rangle$')
+#   ax1.plot(avg.x_avg, avg.pc_avg*(avg.v_avg + avg.va_avg)**(gc), 'r-o', label='$\\langle P_c\\rangle (\\langle v\\rangle + \\langle v_A\\rangle)^{\\gamma_c}$')
+#   # ax1.plot(avg.x_avg, fit_invar[0]*avg.x_avg + fit_invar[1], 'k--', label='slope=${:.3f}$'.format(fit_invar[0]))
+#   # ax1.plot(avg.x_avg, fit_invar2[0]*avg.x_avg + fit_invar2[1], color='brown', linestyle='--', label='slope=${:.3f}$'.format(fit_invar2[0]))
+
+#   # ax2.loglog(-np.gradient(avg.pc_avg, avg.x_avg), -avg.cr_pushing_avg)
+#   # ax2.loglog(-np.gradient(avg.pc_avg, avg.x_avg), np.exp(fit_push[1])*(-np.gradient(avg.pc_avg, avg.x_avg))**(fit_push[0]), 'k--', label='slope=${:.3f}$'.format(fit_push[0]))
+#   ax2.loglog(avg.x_avg, -np.gradient(avg.pc_avg, avg.x_avg), 'k--', label='$-\\mathrm{d}\\langle P_c\\rangle/\\mathrm{d} x$')
+#   ax2.loglog(avg.x_avg, -avg.cr_pushing_avg, label='$\\langle\\sigma_c (F_c - \\gamma_c E_c v)\\rangle$')
+#   # ax3.loglog(-(avg.v_avg + avg.va_avg)*np.gradient(avg.pc_avg, avg.x_avg), -avg.cr_heating_avg) 
+#   # ax3.loglog(-(avg.v_avg + avg.va_avg)*np.gradient(avg.pc_avg, avg.x_avg), np.exp(fit_heat[1])*(-(avg.v_avg + avg.va_avg)*np.gradient(avg.pc_avg, avg.x_avg))**(fit_heat[0]), \
+#     # 'k--', label='slope=${:.3f}$'.format(fit_heat[0]))
+#   ax3.loglog(avg.x_avg, -(avg.v_avg + avg.va_avg)*np.gradient(avg.pc_avg, avg.x_avg), 'k--', label='$-(\\langle v\\rangle + \\langle v_A\\rangle)\\mathrm{d}\\langle P_c\\rangle/\\mathrm{d} x$')
+#   ax3.loglog(avg.x_avg, -avg.cr_heating_avg, label='$\\langle(v + v_A)\\sigma_c (F_c - \\gamma_c E_c v)\\rangle$')
+
+#   ax4.loglog(avg.x_avg, avg.cr_heating_avg/((avg.v_avg + avg.va_avg)*np.gradient(avg.pc_avg, avg.x_avg)))
+
+#   ax1.margins(x=0)
+#   ax1.set_xlabel('$x$')
+#   ax1.legend(frameon=False)
+#   # ax1.set_ylabel('$\\langle P_c\\rangle (\\langle v\\rangle + \\langle v_A\\rangle)^{\\gamma_c}$')
+
+#   ax2.legend(frameon=False)
+#   ax3.legend(frameon=False)
+#   ax2.margins(x=0)
+#   ax3.margins(x=0)
+#   ax4.margins(x=0)
+#   # ax2.set_xlabel('$-\\mathrm{d}\\langle P_c\\rangle/\\mathrm{d} x$')
+#   # ax3.set_xlabel('$-(\\langle v\\rangle + \\langle v_A\\rangle)\\mathrm{d}\\langle P_c\\rangle/\\mathrm{d} x$')
+#   ax2.set_xlabel('$x$')
+#   ax3.set_xlabel('$x$')
+#   ax4.set_xlabel('$x$')
+#   # ax2.set_ylabel('$\\langle\\sigma_c (F_c - \\gamma_c E_c v)\\rangle$')
+#   # ax3.set_ylabel('$\\langle(v + v_A)\\sigma_c (F_c - \\gamma_c E_c v)\\rangle$')
+#   ax4.set_ylabel('$\\langle(v + v_A)\\sigma_c (F_c - \\gamma_c E_c v)\\rangle/(\\langle v\\rangle + \\langle v_A\\rangle)\\mathrm{d}\\langle P_c\\rangle/\\mathrm{d} x$')
+
+#   fig1.tight_layout()
+#   fig2.tight_layout()
+#   fig3.tight_layout()
+#   fig1.savefig('./invar.png', dpi=300)
+#   fig2.savefig('./source.png', dpi=300)
+#   fig3.savefig('./suppressed.png', dpi=300)
+
+#   plt.show()
+
+# #########################
+# # Plots for publication
+
+# # Nonlinear evolution of staircase
+# latexify(columns=2)
+
+# fig = plt.figure()
+# grids = gs.GridSpec(2, 3, figure=fig)
+# ax1 = fig.add_subplot(grids[0, 0])
+# ax2 = fig.add_subplot(grids[0, 1])
+# ax3 = fig.add_subplot(grids[0, 2])
+# ax4 = fig.add_subplot(grids[1, 0])
+# ax5 = fig.add_subplot(grids[1, 1])
+# ax6 = fig.add_subplot(grids[1, 2])
+
+# lab = ['$\\rho$', '$v$', '$P_g$', '$P_c$', '$F_c$', '$T$']
+
+# ax1.plot(one.x1v, one.rho_array[0], 'k--', label='t=0.0')
+# ax2.plot(one.x1v, one.vx_array[0], 'k--', label='t=0.0')
+# ax3.plot(one.x1v, one.pg_array[0], 'k--', label='t=0.0')
+# ax4.plot(one.x1v, one.ecr_array[0]*(gc - 1.), 'k--', label='t=0.0')
+# ax5.plot(one.x1v, one.fcx_array[0]*one.vmax, 'k--', label='t=0.0')
+# ax6.plot(one.x1v, one.pg_array[0]/one.rho_array[0], 'k--', label='t=0.0')
+
+# temp_min = 0.01
+# temp = one.pg_array[1]/one.rho_array[1]
+# ind_del = np.where(temp < temp_min)[0]
+# x1v = np.delete(one.x1v, ind_del)
+
+# ax1.plot(x1v, np.delete(one.rho_array[1], ind_del), label='t={:.2f}'.format(one.time_array[1]))
+# ax2.plot(x1v, np.delete(one.vx_array[1], ind_del), label='t={:.2f}'.format(one.time_array[1]))
+# ax3.plot(x1v, np.delete(one.pg_array[1], ind_del), label='t={:.2f}'.format(one.time_array[1]))
+# ax4.plot(x1v, np.delete(one.ecr_array[1]*(gc - 1.), ind_del), label='t={:.2f}'.format(one.time_array[1]))
+# ax5.plot(x1v, np.delete(one.fcx_array[1]*one.vmax, ind_del), label='t={:.2f}'.format(one.time_array[1]))
+# ax6.plot(x1v, np.delete(temp, ind_del), label='t={:.2f}'.format(one.time_array[1]))
+
+# for i, axes in enumerate(fig.axes):
+#   axes.margins(x=0)
+#   axes.set_xlabel('$x$')
+#   axes.set_ylabel(lab[i])
+#   axes.legend(frameon=False)
+#   if (axes != ax2) and (axes != ax5):
+#     axes.set_yscale('log')
+#     axes.xaxis.set_minor_locator(AutoMinorLocator())
+#   else:
+#     axes.yaxis.set_minor_locator(AutoMinorLocator())
+#     axes.xaxis.set_minor_locator(AutoMinorLocator())
+
+# fig.tight_layout()
+# fig.savefig('/Users/tsunhinnavintsung/Desktop/Publish/alpha1beta1eta_01psi0_gauss.png', dpi=300)
+
+# plt.show()
+# plt.close('all')
+
+# plotdefault()
